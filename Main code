@@ -1,0 +1,162 @@
+import os
+import io
+import time
+import json
+import base64
+import requests
+import pandas as pd
+from pathlib import Path
+from PIL import Image, UnidentifiedImageError
+
+# ==========================================
+# 1. Configuration — NO API KEY NEEDED (runs 100% locally)
+# ==========================================
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "llava"   # llama3.2-vision currently has a known broken-architecture bug in recent Ollama versions (June 2026) — llava is stable
+
+IMAGE_FOLDER_PATH = Path('/Users/shaunak/Desktop/BP MONITOR APPRATUS IMAGES/clear images')
+
+# Always save the output CSV next to this script file, no matter which
+# directory you happen to be in when you run it (fixes "Read-only file
+# system" errors when run from / or other protected locations).
+SCRIPT_DIR = Path(__file__).resolve().parent
+CSV_OUTPUT_PATH = SCRIPT_DIR / "medical_data_export_ollama.csv"
+
+PROMPT = """You are an expert medical data extractor.
+Look at this medical device screen (blood pressure monitor) and extract the exact values shown.
+
+Respond ONLY with a single JSON object in this exact format, nothing else, no markdown fences, no explanation:
+{"systolic": <int>, "diastolic": <int>, "pulse": <int>, "brand": "<string>", "has_glare": <true/false>}
+
+If a value is unreadable, use 0 for numbers or "Unknown" for brand."""
+
+# ==========================================
+# 2. Image prep — normalize to RGB JPEG so Ollama doesn't choke on
+#    odd formats (PNG palette mode, CMYK, HEIC-converted weirdness, etc.)
+# ==========================================
+def load_image_as_base64(image_path: Path) -> str:
+    img = Image.open(image_path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+# ==========================================
+# 3. Check Ollama is actually reachable before doing anything else
+# ==========================================
+def check_ollama_running() -> bool:
+    try:
+        r = requests.get("http://localhost:11434", timeout=5)
+        return True
+    except requests.exceptions.ConnectionError:
+        return False
+
+# ==========================================
+# 4. Extraction function with retries on malformed JSON
+# ==========================================
+def analyze_screen(image_path: Path, max_retries=3):
+    try:
+        img_b64 = load_image_as_base64(image_path)
+    except UnidentifiedImageError:
+        return {"file_name": image_path.name, "error": "Invalid image format"}
+    except Exception as e:
+        return {"file_name": image_path.name, "error": f"Image load failed: {e}"}
+
+    attempt = 0
+    raw_text = ""
+    while attempt < max_retries:
+        try:
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": MODEL_NAME,
+                    "prompt": PROMPT,
+                    "images": [img_b64],
+                    "stream": False,
+                    "options": {"temperature": 0.0}
+                },
+                timeout=180  # local vision models can be slow, especially on CPU
+            )
+            response.raise_for_status()
+            raw_text = response.json().get("response", "").strip()
+
+            # Strip markdown code fences if the model adds them despite instructions
+            if raw_text.startswith("```"):
+                raw_text = raw_text.strip("`")
+                if raw_text.lower().startswith("json"):
+                    raw_text = raw_text[4:].strip()
+
+            data = json.loads(raw_text)
+            data["file_name"] = image_path.name
+            return data
+
+        except requests.exceptions.ConnectionError:
+            return {"file_name": image_path.name,
+                     "error": "Ollama server not reachable — run 'ollama serve' or check it's running"}
+
+        except json.JSONDecodeError:
+            attempt += 1
+            print(f"   ⚠️ Non-JSON output (attempt {attempt}/{max_retries}): {raw_text[:150]}")
+            time.sleep(1)
+
+        except Exception as e:
+            return {"file_name": image_path.name, "error": f"Error: {e}"}
+
+    return {"file_name": image_path.name, "error": "Model never returned valid JSON after retries"}
+
+# ==========================================
+# 5. Run process, skip already-processed images on re-runs, export CSV
+# ==========================================
+def main():
+    if not check_ollama_running():
+        print("❌ Ollama isn't reachable at localhost:11434.")
+        print("   Run 'ollama serve' in a terminal, or check the Ollama app is running.")
+        return
+
+    if not IMAGE_FOLDER_PATH.exists():
+        print(f"❌ Directory not found: {IMAGE_FOLDER_PATH}")
+        return
+
+    extensions = {'.png', '.jpg', '.jpeg'}
+    images = sorted([f for f in IMAGE_FOLDER_PATH.iterdir() if f.suffix.lower() in extensions])
+
+    # Resume support: if a previous CSV exists, skip files already extracted successfully
+    already_done = set()
+    existing_rows = []
+    if os.path.exists(CSV_OUTPUT_PATH):
+        prev_df = pd.read_csv(CSV_OUTPUT_PATH)
+        for _, row in prev_df.iterrows():
+            if pd.isna(row.get("error")) or row.get("error") == "":
+                already_done.add(row["file_name"])
+                existing_rows.append(row.to_dict())
+        if already_done:
+            print(f"📌 Resuming — {len(already_done)} image(s) already extracted successfully, skipping those.")
+
+    pending = [f for f in images if f.name not in already_done]
+    print(f"🔍 Found {len(images)} images total, {len(pending)} left to process.")
+    print(f"🖥️  Using local model: {MODEL_NAME} (no API key, no internet required)\n")
+
+    extracted_rows = existing_rows
+
+    for i, img_path in enumerate(pending, 1):
+        print(f"[{i}/{len(pending)}] Reading: {img_path.name}...")
+        row_data = analyze_screen(img_path)
+        extracted_rows.append(row_data)
+
+        # Save progress after every image, so a crash/interrupt doesn't lose everything
+        df = pd.DataFrame(extracted_rows)
+        cols = ['file_name'] + [c for c in df.columns if c != 'file_name']
+        df = df[cols]
+        df.to_csv(CSV_OUTPUT_PATH, index=False)
+
+        time.sleep(0.5)
+
+    print("\n✅ Extraction complete.")
+    final_df = pd.DataFrame(extracted_rows)
+    print(final_df)
+    print(f"\n📊 Table saved as: {CSV_OUTPUT_PATH}")
+    print("⚠️  Reminder: local vision models can misread small digits — spot-check the readings against the actual photos before trusting them.")
+
+if __name__ == "__main__":
+    main()
