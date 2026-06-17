@@ -14,7 +14,7 @@ from PIL import Image, UnidentifiedImageError
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "llava"   # llama3.2-vision currently has a known broken-architecture bug in recent Ollama versions (June 2026) — llava is stable
 
-IMAGE_FOLDER_PATH = Path('/Users/shaunak/Desktop/BP MONITOR APPRATUS IMAGES/clear images')
+IMAGE_FOLDER_PATH = Path('/Users/shaunak/Desktop/BP MONITOR APPRATUS IMAGES/bp monitor_images')
 
 # Always save the output CSV next to this script file, no matter which
 # directory you happen to be in when you run it (fixes "Read-only file
