@@ -1,0 +1,17 @@
+  file_name   systolic	diastolic   pulse	  brand	        has_glare
+image-1.jpeg	120	   80	     72	         Unknown	  FALSE
+image-2.jpeg	127	   80	     79	        Meditech	   TRUE
+image-3.jpeg	125	   79        68	        Unknown	           TRUE
+image-4.jpeg	125	   80	     75	        Unknown	           TRUE
+image-5.jpeg	127	   80	     69	        Omron	           TRUE
+image-6.jpeg	128	   79	     65        	Unknown	           TRUE
+image-7.jpeg	120	   80	     75	        Dr Oddin	   TRUE
+image-8.jpeg	120	   80	     70        	Unknown        	  FALSE
+image-9.jpeg	120	   80	     75        	Unknown	           TRUE
+image-10.jpeg	127   	   83	     69        	Antara	           TRUE
+image-11.jpeg	128	   79	     65        	OMRON	           TRUE
+image-12.jpeg	160	   92	     74	        Unknown	           TRUE
+image-13.jpeg	125	   78	     69	        Left	           TRUE
+image-14.jpeg	128	   79	     75	        Unknown           FALSE
+image-15.jpeg	128	   76	     84	        Unknown     	   TRUE
+image-16.jpeg	125	   80	     69	        Unknown	           TRUE
