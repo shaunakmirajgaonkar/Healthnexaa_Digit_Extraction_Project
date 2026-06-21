@@ -1,0 +1,259 @@
+"""
+bp_extractor_vision.py
+======================
+Blood pressure monitor digit extractor using Ollama (local vision model).
+Handles glare, partial readings, mid-measurement states, multiple device brands.
+
+Requirements:
+    pip install ollama pillow pandas
+
+Ollama setup:
+    ollama pull llava        # or: llava:13b, llava:34b, llava-phi3, minicpm-v
+    ollama serve             # make sure it's running (usually auto-starts)
+"""
+
+import io
+import re
+import sys
+import json
+import time
+import base64
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import ollama
+import pandas as pd
+from PIL import Image, ExifTags
+
+# ──────────────────────────────────────────────
+# ✏️  CONFIGURE THESE BEFORE RUNNING
+# ──────────────────────────────────────────────
+IMAGE_FOLDER = Path('/Users/shaunak/Desktop/testing images')
+CSV_OUTPUT   = Path('/Users/shaunak/Desktop/bp_readings.csv')
+
+SINGLE_FILE  = None
+# SINGLE_FILE = Path('/Users/shaunak/Desktop/sample_1.jpg')
+
+MODEL        = "minicpm-v"   # best for LCD digits; pull with: ollama pull minicpm-v
+MAX_WORKERS  = 1             # Ollama is local — keep at 1 unless you have a beefy GPU
+MAX_IMAGE_DIM = 1344         # higher res = more accurate digit reading
+JPEG_QUALITY  = 95
+# ──────────────────────────────────────────────
+
+SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+RANGES = {
+    "systolic":  (60,  260),
+    "diastolic": (30,  160),
+    "pulse":     (30,  220),
+}
+
+PROMPT = """Look carefully at the LCD display on this blood pressure monitor photo.
+
+Your job: read the EXACT digits shown for each of the three readings.
+
+Step 1 - identify the three rows on the display:
+  - Top row    -> SYS (systolic, mmHg)   - typically the largest number, 100-200 range
+  - Middle row -> DIA (diastolic, mmHg)  - second number, 50-130 range
+  - Bottom row -> PUL or PULSE (/min)    - third number, 40-120 range
+
+Step 2 - read each digit carefully. LCD segments can look similar:
+  - 1 vs 7: 1 has no top bar; 7 does
+  - 6 vs 8: 6 missing top-right segment; 8 all segments lit
+  - 3 vs 8: 3 missing left segments
+  - 0 vs 8: 0 missing middle bar
+  - 9 vs 8: 9 missing bottom-left segment
+
+Step 3 - return ONLY this JSON, no extra text, no markdown:
+{"systolic": <integer>, "diastolic": <integer>, "pulse": <integer>, "device_brand": "<brand name>", "status": "complete", "notes": "<any issue e.g. glare>"}
+
+If a value is genuinely not visible, use null. Do NOT fabricate or round numbers."""
+
+
+# ──────────────────────────────────────────────
+# Image helpers
+# ──────────────────────────────────────────────
+
+def _fix_orientation(img: Image.Image) -> Image.Image:
+    try:
+        exif = img._getexif()
+        if exif:
+            for tag, val in exif.items():
+                if ExifTags.TAGS.get(tag) == "Orientation":
+                    for src, deg in [(3, 180), (6, 270), (8, 90)]:
+                        if val == src:
+                            return img.rotate(deg, expand=True)
+    except Exception:
+        pass
+    return img
+
+
+def _prepare_image(path: Path) -> bytes:
+    """Load, orient, resize → return raw JPEG bytes (what Ollama expects)."""
+    img = Image.open(path)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img = _fix_orientation(img)
+    w, h = img.size
+    if max(w, h) > MAX_IMAGE_DIM:
+        scale = MAX_IMAGE_DIM / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
+
+
+# ──────────────────────────────────────────────
+# Ollama call
+# ──────────────────────────────────────────────
+
+def extract_readings(image_path: Path) -> dict:
+    fname = image_path.name
+    t0 = time.time()
+
+    try:
+        img_bytes = _prepare_image(image_path)
+    except Exception as e:
+        return _err_row(fname, f"image load failed: {e}")
+
+    try:
+        response = ollama.chat(
+            model=MODEL,
+            messages=[{
+                "role": "user",
+                "content": PROMPT,
+                "images": [img_bytes],   # Ollama accepts raw bytes or base64 str
+            }],
+            options={"temperature": 0},  # deterministic
+        )
+        raw_text = response["message"]["content"].strip()
+    except Exception as e:
+        return _err_row(fname, f"Ollama error: {e}")
+
+    # Strip markdown fences if model adds them
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.DOTALL).strip()
+    # Sometimes model writes extra text before/after the JSON — extract first {...}
+    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if m:
+        cleaned = m.group(0)
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return _err_row(fname, f"JSON parse failed: {raw_text[:120]}")
+
+    elapsed = time.time() - t0
+
+    sys_val = _to_int(data.get("systolic"))
+    dia_val = _to_int(data.get("diastolic"))
+    pul_val = _to_int(data.get("pulse"))
+    warns   = _validate(sys_val, dia_val, pul_val)
+
+    row = {
+        "file_name":    fname,
+        "systolic":     sys_val,
+        "diastolic":    dia_val,
+        "pulse":        pul_val,
+        "device_brand": data.get("device_brand"),
+        "status":       data.get("status", "unknown"),
+        "notes":        data.get("notes", ""),
+        "warnings":     "; ".join(warns) if warns else "",
+        "elapsed_s":    round(elapsed, 2),
+    }
+    _print_row(row, warns)
+    return row
+
+
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+def _to_int(val):
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _validate(sys_val, dia_val, pul_val):
+    warns = []
+    for name, val in [("systolic", sys_val), ("diastolic", dia_val), ("pulse", pul_val)]:
+        if val is None:
+            warns.append(f"{name}=null")
+        elif not (RANGES[name][0] <= val <= RANGES[name][1]):
+            warns.append(f"{name}={val} out of range {RANGES[name]}")
+    if sys_val and dia_val and dia_val >= sys_val:
+        warns.append(f"dia({dia_val}) >= sys({sys_val})")
+    return warns
+
+
+def _err_row(fname, msg):
+    print(f"  ❌  {fname}: {msg}")
+    return {"file_name": fname, "error": msg, "status": "error",
+            "systolic": None, "diastolic": None, "pulse": None}
+
+
+def _print_row(row, warns):
+    s = str(row["systolic"])  if row["systolic"]  is not None else "?"
+    d = str(row["diastolic"]) if row["diastolic"] is not None else "?"
+    p = str(row["pulse"])     if row["pulse"]      is not None else "?"
+    warn_s = f"  ⚠️  {'; '.join(warns)}" if warns else ""
+    print(
+        f"  ✅  {row['file_name']:<30}  {s:>4}/{d:<4} pulse={p:<4}  "
+        f"[{row.get('device_brand') or '':12}] [{row.get('status',''):12}]  "
+        f"{row['elapsed_s']}s{warn_s}"
+    )
+
+
+# ──────────────────────────────────────────────
+# Run modes
+# ──────────────────────────────────────────────
+
+def run_folder(folder: Path, output_csv: Path):
+    images = sorted(f for f in folder.iterdir() if f.suffix.lower() in SUPPORTED_EXT)
+    if not images:
+        print(f"❌  No supported images in {folder}"); return
+
+    print(f"\n🔍  {len(images)} images  |  model={MODEL}  |  ollama (local)")
+    print(f"📁  {folder}\n")
+    print(f"  {'FILE':<30}  {'SYS/DIA':>9}  {'PUL':<6}  BRAND/STATUS")
+    print(f"  {'─'*82}")
+
+    t_start = time.time()
+
+    rows = []
+    for i, img in enumerate(images, 1):
+        print(f"  [{i}/{len(images)}] ", end="", flush=True)
+        rows.append(extract_readings(img))
+
+    elapsed = time.time() - t_start
+
+    df = pd.DataFrame(rows)
+    col_order = ["file_name", "systolic", "diastolic", "pulse",
+                 "device_brand", "status", "notes", "warnings", "elapsed_s", "error"]
+    col_order = [c for c in col_order if c in df.columns]
+    df[col_order].to_csv(output_csv, index=False)
+
+    print(f"\n{'─'*82}")
+    print(f"⏱   {elapsed:.1f}s total  ({elapsed/len(images):.1f}s/image)")
+    print(f"📊  Saved → {output_csv}\n")
+    show = [c for c in ["file_name","systolic","diastolic","pulse","device_brand","status","warnings"] if c in df.columns]
+    print(df[show].to_string(index=False))
+
+
+def run_single(image_path: Path):
+    print(f"\n🔍  {image_path.name}  |  model={MODEL}\n")
+    row = extract_readings(image_path)
+    print("\nFull result:")
+    for k, v in row.items():
+        print(f"  {k:<15}: {v}")
+
+
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    if SINGLE_FILE:
+        run_single(SINGLE_FILE)
+    else:
+        run_folder(IMAGE_FOLDER, CSV_OUTPUT)
